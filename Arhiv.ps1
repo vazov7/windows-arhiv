@@ -1,9 +1,9 @@
-﻿# Arhiv.ps1 - дневен архив на папка (GSOL.bg)
-# Настройките (коя папка, къде, колко архива) са в nastroiki.txt до този файл.
+﻿# Arhiv.ps1 - дневен архив на папки (GSOL.bg)
+# Настройките (кои папки, къде, колко архива) са в nastroiki.txt до този файл.
 # ТУК НИЩО НЕ СЕ ПИПА.
 #
 #   Arhiv.ps1               - работи във фона: на всеки 10 мин. проверява дали е време за архив
-#   Arhiv.ps1 -Sega         - прави един архив веднага (за проба)
+#   Arhiv.ps1 -Sega         - прави архив на всички папки веднага (за проба)
 #   Arhiv.ps1 -Instalirai   - пуска се заедно с Windows + стартира веднага
 #   Arhiv.ps1 -Premahni     - спира и маха автоматичното пускане (архивите остават)
 
@@ -13,19 +13,23 @@ $ErrorActionPreference = 'Stop'
 $Papka   = $PSScriptRoot
 $CfgFile = Join-Path $Papka 'nastroiki.txt'
 $LogFile = Join-Path $Papka 'arhiv_log.txt'
-$ImeRe   = '^Arhiv_(\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2})\.zip$'   # трием САМО файлове с точно такова име
 $PrimerenPat = 'ТУК_НАПИШИ'
 $ProverkaMin = 10
+$ZapasMB = 200          # минимум свободно място над размера на папката
 $Interactive = $Sega -or $Instalirai -or $Premahni
 
-# уникално име според мястото на скрипта (може да има няколко копия за няколко папки)
+# уникално име според мястото на скрипта (може да има няколко копия)
 $md5 = [Security.Cryptography.MD5]::Create()
 $hash = [BitConverter]::ToString($md5.ComputeHash([Text.Encoding]::UTF8.GetBytes($PSCommandPath.ToLowerInvariant()))).Replace('-', '').Substring(0, 12)
 $ImeMutex = 'GSOL_Arhiv_' + $hash
 
-$script:posledno = ''
-function Log([string]$t, [switch]$Vednuzh) {
-    if ($Vednuzh) { if ($script:posledno -eq $t) { return }; $script:posledno = $t } else { $script:posledno = '' }
+# Повтарящо се съобщение (на всеки 10 мин.) се пише само веднъж - отделно за всяка папка
+$script:posledno = @{}
+function Log([string]$t, [switch]$Vednuzh, [string]$Kluch = '-') {
+    if ($Vednuzh) {
+        if ($script:posledno.ContainsKey($Kluch) -and $script:posledno[$Kluch] -eq $t) { return }
+        $script:posledno[$Kluch] = $t
+    }
     $line = (Get-Date -Format 'yyyy-MM-dd HH:mm:ss') + '  ' + $t
     if ($Interactive) { Write-Host $line }
     try {
@@ -36,6 +40,7 @@ function Log([string]$t, [switch]$Vednuzh) {
         }
     } catch {}
 }
+function Log-Ok([string]$Kluch) { $script:posledno.Remove($Kluch) }
 
 function Normalize([string]$p) {
     $p = [IO.Path]::GetFullPath($p)
@@ -54,7 +59,8 @@ function Read-Cfg {
     }
     $text = $text.TrimStart([char]0xFEFF)
 
-    $c = @{ IZVOR = ''; CEL = ''; MAKS_ARHIVI = '50'; CHASA_MEZHDU = '24' }
+    $c = @{ CEL = ''; MAKS_ARHIVI = '50'; CHASA_MEZHDU = '24'; PROPUSNI = '' }
+    $izvori = New-Object System.Collections.ArrayList
     foreach ($ln in ($text -split "`r?`n")) {
         $ln = $ln.Trim()
         if ($ln -eq '' -or $ln.StartsWith('#')) { continue }
@@ -62,62 +68,108 @@ function Read-Cfg {
         if ($i -lt 1) { continue }
         $k = $ln.Substring(0, $i).Trim().ToUpperInvariant()
         $v = $ln.Substring($i + 1).Trim().Trim('"', "'", ' ')
-        if ($c.ContainsKey($k)) { $c[$k] = $v }
+        if ($k -eq 'IZVOR') { if ($v -ne '' -and $v -notlike "*$PrimerenPat*") { [void]$izvori.Add($v) } }
+        elseif ($c.ContainsKey($k)) { $c[$k] = $v }
     }
-    if ($c.IZVOR -eq '' -or $c.IZVOR -like "*$PrimerenPat*") { throw "Не е написана папката за архивиране (IZVOR=...) в $CfgFile" }
-    if ($c.CEL -eq '')   { throw "Не е написано къде да се пазят архивите (CEL=...) в $CfgFile" }
+    if ($izvori.Count -eq 0) { throw "Не е написана нито една папка за архивиране (IZVOR=...) в $CfgFile" }
+    if ($c.CEL -eq '')       { throw "Не е написано къде да се пазят архивите (CEL=...) в $CfgFile" }
     $n = 0; if (-not [int]::TryParse($c.MAKS_ARHIVI, [ref]$n) -or $n -lt 1)  { throw "MAKS_ARHIVI трябва да е цяло число от 1 нагоре (сега: '$($c.MAKS_ARHIVI)')" }
     $c.MAKS = $n
     $h = 0; if (-not [int]::TryParse($c.CHASA_MEZHDU, [ref]$h) -or $h -lt 1) { throw "CHASA_MEZHDU трябва да е цяло число от 1 нагоре (сега: '$($c.CHASA_MEZHDU)')" }
     $c.CHASA = $h
-    $c.IZVOR = Normalize $c.IZVOR
-    $c.CEL   = Normalize $c.CEL
+    $c.CEL = Normalize $c.CEL
+    $c.PROP = @($c.PROPUSNI -split ';' | ForEach-Object { $_.Trim().Trim('\', '/') } | Where-Object { $_ -ne '' })
+
     $sep = [IO.Path]::DirectorySeparatorChar
-    $iz = $c.IZVOR.TrimEnd('\', '/') + $sep
     $ce = $c.CEL.TrimEnd('\', '/') + $sep
-    if ($ce.StartsWith($iz, [StringComparison]::OrdinalIgnoreCase)) {
-        throw "Папката за архивите ($($c.CEL)) е ВЪТРЕ в папката, която се архивира - така всеки архив ще съдържа предишните. Сложи CEL на друго място."
+    $lst = New-Object System.Collections.ArrayList
+    $imena = @{}
+    foreach ($raw in $izvori) {
+        $iz = Normalize $raw
+        if ($lst | Where-Object { $_.Izvor -eq $iz }) { continue }   # една папка, написана два пъти
+        if ($ce.StartsWith($iz.TrimEnd('\', '/') + $sep, [StringComparison]::OrdinalIgnoreCase)) {
+            throw "Папката за архивите ($($c.CEL)) е ВЪТРЕ в $iz - така всеки архив ще съдържа предишните. Сложи CEL на друго място."
+        }
+        $ime = Split-Path $iz -Leaf
+        if (-not $ime -or $ime -match '[:\\/]') { $ime = 'Disk' }
+        $ime = $ime -replace '[<>:"/\\|?*]', '_'
+        $baza = $ime; $nr = 2
+        while ($imena.ContainsKey($ime.ToLowerInvariant())) { $ime = "${baza}_$nr"; $nr++ }
+        $imena[$ime.ToLowerInvariant()] = 1
+        [void]$lst.Add(@{
+            Izvor = $iz
+            Ime   = $ime
+            Cel   = (Join-Path $c.CEL $ime)
+            Re    = '^' + [regex]::Escape($ime) + '_(\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2})\.zip$'   # трием САМО такива имена
+        })
     }
+    $c.IZVORI = $lst
     return $c
 }
 
-function Get-Arhivi([string]$cel) {
-    if (-not (Test-Path -LiteralPath $cel -PathType Container)) { return @() }
-    return @(Get-ChildItem -LiteralPath $cel -File | Where-Object { $_.Name -match $ImeRe } | Sort-Object Name)
+function Get-Arhivi($s) {
+    if (-not (Test-Path -LiteralPath $s.Cel -PathType Container)) { return @() }
+    $re = $s.Re
+    return @(Get-ChildItem -LiteralPath $s.Cel -File | Where-Object { $_.Name -match $re } | Sort-Object Name)
 }
 
-function Get-Vreme($f) {
-    $m = [regex]::Match($f.Name, $ImeRe)
+function Get-Vreme($s, $f) {
+    $m = [regex]::Match($f.Name, $s.Re)
     return [datetime]::ParseExact($m.Groups[1].Value, 'yyyy-MM-dd_HH-mm-ss', [Globalization.CultureInfo]::InvariantCulture)
 }
 
-function Make-Arhiv($c) {
-    $izvor = $c.IZVOR; $cel = $c.CEL
+function Propusni([string]$rel, $pats) {
+    foreach ($p in $pats) {
+        if ($rel -like $p -or $rel -like "$p\*" -or $rel -like "$p/*") { return $true }
+        foreach ($seg in ($rel -split '[\\/]')) { if ($seg -like $p) { return $true } }
+    }
+    return $false
+}
+
+function Make-Arhiv($c, $s) {
+    $izvor = $s.Izvor; $cel = $s.Cel; $K = $s.Ime
     if (-not (Test-Path -LiteralPath $izvor -PathType Container)) {
-        Log "НЕ Е НАПРАВЕН: папката за архивиране я няма: $izvor (изключен диск? грешен път?). Пробвам пак след $ProverkaMin мин." -Vednuzh
+        Log "[$K] НЕ Е НАПРАВЕН: папката я няма: $izvor (изключен диск? грешен път?). Пробвам пак след $ProverkaMin мин." -Vednuzh -Kluch $K
         return $false
     }
     if (-not (Test-Path -LiteralPath $cel -PathType Container)) {
         try { New-Item -ItemType Directory -Path $cel -Force | Out-Null }
-        catch { Log "НЕ Е НАПРАВЕН: не мога да създам папката за архивите: $cel ($($_.Exception.Message)). Пробвам пак след $ProverkaMin мин." -Vednuzh; return $false }
+        catch { Log "[$K] НЕ Е НАПРАВЕН: не мога да създам папката за архивите: $cel ($($_.Exception.Message))." -Vednuzh -Kluch $K; return $false }
     }
 
-    $files = @(Get-ChildItem -LiteralPath $izvor -Recurse -File -Force -ErrorAction SilentlyContinue)
+    $vsichki = @(Get-ChildItem -LiteralPath $izvor -Recurse -File -Force -ErrorAction SilentlyContinue)
+    $files = New-Object System.Collections.ArrayList
+    $izkl = 0
+    foreach ($f in $vsichki) {
+        $rel = $f.FullName.Substring($izvor.Length).TrimStart('\', '/')
+        if ($c.PROP.Count -gt 0 -and (Propusni $rel $c.PROP)) { $izkl++; continue }
+        [void]$files.Add($f)
+    }
     if ($files.Count -eq 0) {
-        Log "НЕ Е НАПРАВЕН: папката $izvor е празна (или няма достъп) - не правя празен архив, за да не изместя добрите стари." -Vednuzh
+        Log "[$K] НЕ Е НАПРАВЕН: папката $izvor е празна (или няма достъп) - не правя празен архив, за да не изместя добрите стари." -Vednuzh -Kluch $K
         return $false
     }
 
+    # място на диска: поне колкото папката + запас
+    $obshto = [long](($files | Measure-Object -Property Length -Sum).Sum)
+    try {
+        $disk = New-Object IO.DriveInfo -ArgumentList ([IO.Path]::GetPathRoot($cel))
+        $nuzhno = $obshto + $ZapasMB * 1MB
+        if ($disk.AvailableFreeSpace -lt $nuzhno) {
+            Log "[$K] НЕ Е НАПРАВЕН: няма място на $($disk.Name) - свободни $([math]::Round($disk.AvailableFreeSpace/1GB,1)) GB, трябват около $([math]::Round($nuzhno/1GB,1)) GB. Намали MAKS_ARHIVI или освободи място." -Vednuzh -Kluch $K
+            return $false
+        }
+    } catch {}
+
     # остатъци от прекъснат архив (спрян ток, изключен компютър)
-    Get-ChildItem -LiteralPath $cel -File -Filter 'Arhiv_*.zip.part' -ErrorAction SilentlyContinue | ForEach-Object {
+    Get-ChildItem -LiteralPath $cel -File -Filter "$($s.Ime)_*.zip.part" -ErrorAction SilentlyContinue | ForEach-Object {
         try { Remove-Item -LiteralPath $_.FullName -Force } catch {}
     }
 
     $stamp = Get-Date -Format 'yyyy-MM-dd_HH-mm-ss'
-    $final = Join-Path $cel ('Arhiv_' + $stamp + '.zip')
+    $final = Join-Path $cel ($s.Ime + '_' + $stamp + '.zip')
     $part  = $final + '.part'
-    $root  = Split-Path $izvor -Leaf
-    if (-not $root -or $root -match '[:\\/]') { $root = 'Arhiv' }
+    $root  = $s.Ime
 
     Add-Type -AssemblyName System.IO.Compression
     $ok = 0; $skip = 0
@@ -130,7 +182,7 @@ function Make-Arhiv($c) {
             try { $src = [IO.File]::Open($f.FullName, [IO.FileMode]::Open, [IO.FileAccess]::Read, ([IO.FileShare]::ReadWrite -bor [IO.FileShare]::Delete)) }
             catch {
                 $skip++
-                if ($skip -le 20) { Log "  пропуснат (зает или без достъп): $($f.FullName)" }
+                if ($skip -le 20) { Log "[$K]   пропуснат (зает от програма или без достъп): $($f.FullName)" }
                 continue
             }
             try {
@@ -148,29 +200,31 @@ function Make-Arhiv($c) {
         if ($zip) { try { $zip.Dispose() } catch {} }
         if ($fs)  { try { $fs.Dispose() } catch {} }
         try { Remove-Item -LiteralPath $part -Force -ErrorAction SilentlyContinue } catch {}
-        Log "НЕ Е НАПРАВЕН: грешка при писане на архива ($($_.Exception.Message)). Свършило място? Изключен диск? Пробвам пак след $ProverkaMin мин." -Vednuzh
+        Log "[$K] НЕ Е НАПРАВЕН: грешка при писане на архива ($($_.Exception.Message)). Пробвам пак след $ProverkaMin мин." -Vednuzh -Kluch $K
         return $false
     }
 
     if ($ok -eq 0) {
         Remove-Item -LiteralPath $part -Force -ErrorAction SilentlyContinue
-        Log "НЕ Е НАПРАВЕН: нито един файл не можа да се прочете от $izvor." -Vednuzh
+        Log "[$K] НЕ Е НАПРАВЕН: нито един файл не можа да се прочете от $izvor." -Vednuzh -Kluch $K
         return $false
     }
 
     Move-Item -LiteralPath $part -Destination $final
+    Log-Ok $K
     $mb = [math]::Round((Get-Item -LiteralPath $final).Length / 1MB, 1)
-    $msg = "ГОТОВ: $(Split-Path $final -Leaf) - $ok файла, $mb MB"
-    if ($skip -gt 0) { $msg += ", ПРОПУСНАТИ $skip (заети/без достъп)" }
+    $msg = "[$K] ГОТОВ: $(Split-Path $final -Leaf) - $ok файла, $mb MB"
+    if ($izkl -gt 0) { $msg += ", изключени по PROPUSNI $izkl" }
+    if ($skip -gt 0) { $msg += ", ПРОПУСНАТИ $skip (заети от програма/без достъп)" }
     Log $msg
 
     # само най-новите MAKS архива остават
-    $all = @(Get-Arhivi $cel)
+    $all = @(Get-Arhivi $s)
     $izlishni = $all.Count - $c.MAKS
     if ($izlishni -gt 0) {
         $all | Select-Object -First $izlishni | ForEach-Object {
-            try { Remove-Item -LiteralPath $_.FullName -Force; Log "  изтрит стар архив: $($_.Name)" }
-            catch { Log "  не можах да изтрия $($_.Name): $($_.Exception.Message)" }
+            try { Remove-Item -LiteralPath $_.FullName -Force; Log "[$K]   изтрит стар архив: $($_.Name)" }
+            catch { Log "[$K]   не можах да изтрия $($_.Name): $($_.Exception.Message)" }
         }
     }
     return $true
@@ -182,20 +236,27 @@ function Lock-Rabota {
     return $m
 }
 
-# Проверка: време ли е? Ако да - прави архив. (под заключване, за да не тръгнат два наведнъж)
+# Проверка: време ли е за всяка папка? Ако да - прави архив. (под заключване, за да не тръгнат два наведнъж)
 function Proveri-I-Arhiviray([switch]$Vinagi) {
     $m = Lock-Rabota
     try {
         $c = Read-Cfg
-        $arh = @(Get-Arhivi $c.CEL)
-        $vreme = $true
-        if (-not $Vinagi -and $arh.Count -gt 0) {
-            $posleden = Get-Vreme $arh[-1]
-            $vreme = ((Get-Date) - $posleden).TotalHours -ge $c.CHASA
+        Log-Ok 'cfg'
+        foreach ($s in $c.IZVORI) {
+            try {
+                $arh = @(Get-Arhivi $s)
+                $vreme = $true
+                if (-not $Vinagi -and $arh.Count -gt 0) {
+                    $posleden = Get-Vreme $s $arh[-1]
+                    $vreme = ((Get-Date) - $posleden).TotalHours -ge $c.CHASA
+                }
+                if ($vreme) { [void](Make-Arhiv $c $s) }
+            } catch {
+                Log "[$($s.Ime)] ГРЕШКА: $($_.Exception.Message)" -Vednuzh -Kluch $s.Ime
+            }
         }
-        if ($vreme) { [void](Make-Arhiv $c) }
     } catch {
-        Log "ГРЕШКА: $($_.Exception.Message)" -Vednuzh
+        Log "ГРЕШКА: $($_.Exception.Message)" -Vednuzh -Kluch 'cfg'
     } finally {
         $m.ReleaseMutex(); $m.Dispose()
     }
@@ -214,7 +275,7 @@ $psExe = Join-Path $PSHOME 'powershell.exe'
 if (-not (Test-Path -LiteralPath $psExe)) { $psExe = (Get-Process -Id $PID).Path }
 $fonArgs = "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$PSCommandPath`""
 
-# ---------- -Sega: един архив веднага ----------
+# ---------- -Sega: архив веднага ----------
 if ($Sega) {
     Log "Ръчен архив (2_ARHIVIRAI_SEGA)..."
     Proveri-I-Arhiviray -Vinagi
@@ -233,24 +294,24 @@ if ($Premahni) {
 # ---------- -Instalirai ----------
 if ($Instalirai) {
     try { $c = Read-Cfg } catch { Log "СПИРАМ: $($_.Exception.Message)"; Log "Отвори nastroiki.txt, оправи го и пусни 1_INSTALIRAI пак."; exit 1 }
-    if (-not (Test-Path -LiteralPath $c.IZVOR -PathType Container)) {
-        Log "СПИРАМ: папката за архивиране я няма: $($c.IZVOR)"
-        Log "Провери пътя в nastroiki.txt (копирай го от адресната лента на папката) и пусни 1_INSTALIRAI пак."
+    $ima = 0
+    foreach ($s in $c.IZVORI) {
+        if (Test-Path -LiteralPath $s.Izvor -PathType Container) { $ima++; Log "Папка за архив : $($s.Izvor)  ->  $($s.Cel)" }
+        else { Log "ВНИМАНИЕ: папката я няма: $($s.Izvor) - провери пътя в nastroiki.txt (другите ще се архивират)." }
+    }
+    if ($ima -eq 0) {
+        Log "СПИРАМ: нито една от папките не съществува. Провери пътищата в nastroiki.txt и пусни 1_INSTALIRAI пак."
         exit 1
     }
-    Log "Папка за архив : $($c.IZVOR)"
-    Log "Архивите отиват: $($c.CEL)"
-    Log "Пази последните: $($c.MAKS) архива, нов на всеки $($c.CHASA) часа"
-    if ([IO.Path]::GetPathRoot($c.IZVOR) -eq [IO.Path]::GetPathRoot($c.CEL)) {
-        Log "ВНИМАНИЕ: архивите са на същия диск - пазят от изтрит/развален файл, но НЕ от развален диск. По-добре е друг диск."
-    }
+    Log "Пази последните: $($c.MAKS) архива за всяка папка, нов на всеки $($c.CHASA) часа"
+    if ($c.PROP.Count -gt 0) { Log "Изключени      : $($c.PROP -join '; ')" }
     $ws = New-Object -ComObject WScript.Shell
-    $s = $ws.CreateShortcut($lnk)
-    $s.TargetPath = $psExe
-    $s.Arguments = $fonArgs
-    $s.WorkingDirectory = $Papka
-    $s.WindowStyle = 7
-    $s.Save()
+    $sc = $ws.CreateShortcut($lnk)
+    $sc.TargetPath = $psExe
+    $sc.Arguments = $fonArgs
+    $sc.WorkingDirectory = $Papka
+    $sc.WindowStyle = 7
+    $sc.Save()
     Log "Добавено в автоматичното пускане с Windows: $lnk"
     foreach ($p in (Get-MoiProcesi)) { try { Stop-Process -Id $p.ProcessId -Force } catch {} }   # стара версия да не остане
     Start-Process -FilePath $psExe -ArgumentList $fonArgs -WindowStyle Hidden
